@@ -26,6 +26,9 @@ type HighwayNote = TimelineEvent & {
 // Faster songs pack notes closer together here, which is what visually
 // communicates tempo.
 const LOOKAHEAD_SECONDS = 2.5;
+// Pause before playback starts, so the player can get their hands in
+// position before the first note arrives.
+const LEAD_IN_MS = 3000;
 
 function HamburgerIcon() {
   return (
@@ -68,6 +71,7 @@ export default function Piano() {
   const [instrumentId, setInstrumentId] = useState<InstrumentId>("piano");
   const [selectedSongId, setSelectedSongId] = useState<string | null>(null);
   const [isSongPlaying, setIsSongPlaying] = useState(false);
+  const [countdown, setCountdown] = useState<number | null>(null);
   const [songActiveMidis, setSongActiveMidis] = useState<Set<number>>(new Set());
   const [highwayNotes, setHighwayNotes] = useState<HighwayNote[] | null>(null);
 
@@ -256,24 +260,19 @@ export default function Piano() {
       rafIdRef.current = null;
     }
 
-    // Release any notes the song currently has sounding.
-    [...activeNotesRef.current.keys()]
-      .filter((id) => id.startsWith("song-"))
-      .forEach((id) => stopNote(id));
-
     setSongActiveMidis(new Set());
     setHighwayNotes(null);
     setIsSongPlaying(false);
+    setCountdown(null);
   }
 
+  // Practice mode: the highway and key highlights show what to play and
+  // when, but nothing sounds until the player presses the key themselves —
+  // startNote()/stopNote() are never called for song events.
   function startSongPlayback(songId: string) {
     const song = SONGS_BY_ID[songId];
     if (!song) return;
     stopSongPlayback();
-
-    // Establish the audio context synchronously within this click handler
-    // so browsers' autoplay-gesture requirement is satisfied.
-    getAudioContext();
 
     const { events, totalSec } = buildTimeline(song);
     const highway: HighwayNote[] = [];
@@ -285,31 +284,43 @@ export default function Piano() {
       }
 
       const timeoutOn = setTimeout(() => {
-        startNote(`song-${event.index}`, event.midi);
         setSongActiveMidis((prev) => new Set(prev).add(event.midi));
-      }, event.startSec * 1000);
+      }, LEAD_IN_MS + event.startSec * 1000);
 
-      // A small gap before the note ends keeps repeated notes articulate.
+      // A small gap before the note ends keeps repeated notes distinct.
       const timeoutOff = setTimeout(() => {
-        stopNote(`song-${event.index}`);
         setSongActiveMidis((prev) => {
           const next = new Set(prev);
           next.delete(event.midi);
           return next;
         });
-      }, (event.startSec + event.durationSec * 0.92) * 1000);
+      }, LEAD_IN_MS + (event.startSec + event.durationSec * 0.92) * 1000);
 
       songTimeoutsRef.current.push(timeoutOn, timeoutOff);
     });
 
     songTimeoutsRef.current.push(
-      setTimeout(() => stopSongPlayback(), totalSec * 1000 + 300)
+      setTimeout(() => stopSongPlayback(), LEAD_IN_MS + totalSec * 1000 + 300)
     );
+
+    // Lead-in countdown, purely for the on-screen "get ready" display.
+    setCountdown(Math.ceil(LEAD_IN_MS / 1000));
+    for (let secondsLeft = Math.ceil(LEAD_IN_MS / 1000) - 1; secondsLeft > 0; secondsLeft--) {
+      songTimeoutsRef.current.push(
+        setTimeout(
+          () => setCountdown(secondsLeft),
+          LEAD_IN_MS - secondsLeft * 1000
+        )
+      );
+    }
+    songTimeoutsRef.current.push(setTimeout(() => setCountdown(null), LEAD_IN_MS));
 
     setHighwayNotes(highway);
     setIsSongPlaying(true);
     playingRef.current = true;
-    playbackStartRef.current = performance.now();
+    // The song's t=0 is LEAD_IN_MS in the future; the highway loop below
+    // naturally handles the countdown since elapsedSec starts out negative.
+    playbackStartRef.current = performance.now() + LEAD_IN_MS;
     rafIdRef.current = requestAnimationFrame(tickHighway);
   }
 
@@ -455,20 +466,35 @@ export default function Piano() {
             />
           ))}
           <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-white/70" />
+
+          {countdown !== null && (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-1 bg-zinc-900/80 text-white">
+              <span className="text-4xl font-bold tabular-nums">{countdown}</span>
+              <span className="text-xs uppercase tracking-wide text-zinc-300">
+                Get ready
+              </span>
+            </div>
+          )}
         </div>
       )}
 
       <div className="relative w-full flex-1">
         {white.map((key, index) => {
-          const isPressed = pressed.has(key.id) || songActiveMidis.has(key.midi);
+          const isGuided = songActiveMidis.has(key.midi);
+          const isUserPressed = pressed.has(key.id);
+          const color = isGuided && isUserPressed
+            ? "bg-emerald-300"
+            : isGuided
+            ? "bg-sky-200"
+            : isUserPressed
+            ? "bg-zinc-200"
+            : "bg-white";
           return (
             <button
               key={key.id}
               aria-label={`${key.note}${key.octave}`}
               {...keyPointerHandlers(key)}
-              className={`absolute bottom-0 top-0 flex items-end justify-center border border-zinc-300 rounded-b-md pb-2 text-xs font-medium text-zinc-400 transition-colors ${
-                isPressed ? "bg-zinc-200" : "bg-white"
-              }`}
+              className={`absolute bottom-0 top-0 flex items-end justify-center border border-zinc-300 rounded-b-md pb-2 text-xs font-medium text-zinc-400 transition-colors ${color}`}
               style={{
                 left: `${index * whiteKeyWidthPct}%`,
                 width: `${whiteKeyWidthPct}%`,
@@ -482,15 +508,21 @@ export default function Piano() {
         })}
 
         {black.map((key) => {
-          const isPressed = pressed.has(key.id) || songActiveMidis.has(key.midi);
+          const isGuided = songActiveMidis.has(key.midi);
+          const isUserPressed = pressed.has(key.id);
+          const color = isGuided && isUserPressed
+            ? "bg-emerald-600"
+            : isGuided
+            ? "bg-sky-600"
+            : isUserPressed
+            ? "bg-zinc-700"
+            : "bg-zinc-900";
           return (
             <button
               key={key.id}
               aria-label={`${key.note}${key.octave}`}
               {...keyPointerHandlers(key)}
-              className={`absolute top-0 z-10 flex items-end justify-center rounded-b-md pb-1 text-[10px] font-medium text-zinc-400 transition-colors ${
-                isPressed ? "bg-zinc-700" : "bg-zinc-900"
-              }`}
+              className={`absolute top-0 z-10 flex items-end justify-center rounded-b-md pb-1 text-[10px] font-medium text-zinc-400 transition-colors ${color}`}
               style={{
                 left: `${
                   (key.globalWhiteIndexBefore + 1) * whiteKeyWidthPct -
